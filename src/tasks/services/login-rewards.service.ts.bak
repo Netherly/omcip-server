@@ -1,0 +1,694 @@
+import { Injectable, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, In } from 'typeorm';
+import { User } from '../../user/entities/user.entity';
+import { UserDailyClaim } from '../entities/user-daily-claim.entity';
+import { DailyBonus, RewardType } from '../entities/daily-bonus.entity';
+import { UserBoost, BoostType } from '../../game/entities/user-boost.entity';
+import { UserTask } from '../entities/user-task.entity';
+import { Task, TaskActionType, TaskPeriod } from '../entities/task.entity';
+import { GameService } from '../../game/game.service';
+
+export interface LoginRewardResponse {
+  day: number;
+  title: string;
+  description: string;
+  reward_type: RewardType;
+  reward_coins?: number;
+  boost_multiplier?: number;
+  boost_duration?: number;
+  claimed: boolean;
+}
+
+@Injectable()
+export class LoginRewardsService {
+  private readonly logger = new Logger(LoginRewardsService.name);
+
+  constructor(
+    @InjectRepository(User)
+    private userRepository: Repository<User>,
+    @InjectRepository(UserDailyClaim)
+    private userDailyClaimRepository: Repository<UserDailyClaim>,
+    @InjectRepository(DailyBonus)
+    private dailyBonusRepository: Repository<DailyBonus>,
+    @InjectRepository(UserBoost)
+    private userBoostRepository: Repository<UserBoost>,
+    @InjectRepository(UserTask)
+    private userTaskRepository: Repository<UserTask>,
+    @InjectRepository(Task)
+    private taskRepository: Repository<Task>,
+    private gameService: GameService,
+  ) {}
+
+  /**
+   * РџРѕР»СѓС‡РёС‚СЊ С‚РµРєСѓС‰РёР№ streak РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ
+   */
+  async getCurrentLoginStreak(userId: string): Promise<number> {
+    try {
+      // РџРѕР»СѓС‡Р°РµРј РІСЃРµ claims РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ Р·Р° РїРѕСЃР»РµРґРЅРёРµ РґРЅРё
+      const claims = await this.userDailyClaimRepository.find({
+        where: { user_id: userId },
+        order: { claimed_at: 'DESC' },
+      });
+
+      if (claims.length === 0) {
+        this.logger.debug(`User ${userId} has no claims yet`);
+        return 0; // РќРµС‚ РєР»РµР№РјРѕРІ - РґРµРЅСЊ 1 РґРѕСЃС‚СѓРїРµРЅ
+      }
+
+      const lastClaim = claims[0];
+
+      // РџСЂРѕРІРµСЂСЏРµРј РґР°С‚Сѓ РїРѕСЃР»РµРґРЅРµР№ РєР»РµР№РјР°
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const claimDate = new Date(lastClaim.claimed_at);
+      claimDate.setHours(0, 0, 0, 0);
+
+      const diffTime = today.getTime() - claimDate.getTime();
+      const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+      // Р•СЃР»Рё Р±С‹Р» РІС…РѕРґ Р±РѕР»РµРµ С‡РµРј 1 РґРµРЅСЊ РЅР°Р·Р°Рґ, СЃС‚СЂРёРє СЃР±СЂР°СЃС‹РІР°РµС‚СЃСЏ
+      if (diffDays > 1) {
+        this.logger.debug(`User ${userId} streak broken (${diffDays} days gap)`);
+        return 0; // РќР°С‡РёРЅР°РµРј РЅРѕРІС‹Р№ СЃС‚СЂРёРє СЃ РґРЅСЏ 1
+      }
+
+      // Р•СЃР»Рё Р±С‹Р» РІС…РѕРґ РІС‡РµСЂР°, РїРµСЂРµС…РѕРґРёРј РЅР° СЃР»РµРґСѓСЋС‰РёР№ РґРµРЅСЊ
+      if (diffDays === 1) {
+        // РќР°Р№С‚Рё РњРђРљРЎРРњРђР›Р¬РќР«Р™ РґРµРЅСЊ_number СЃСЂРµРґРё РІС‡РµСЂР°С€РЅРёС… РєР»РµР№РјРѕРІ
+        const yesterday = new Date(today);
+        yesterday.setDate(yesterday.getDate() - 1);
+        
+        const yesterdaysClaims = claims.filter(claim => {
+          const claimDate = new Date(claim.claimed_at);
+          claimDate.setHours(0, 0, 0, 0);
+          return claimDate.getTime() === yesterday.getTime();
+        });
+        
+        if (yesterdaysClaims.length === 0) {
+          this.logger.debug('No claims yesterday found, returning 1');
+          return 1;
+        }
+        
+        const maxYesterdayDay = Math.max(...yesterdaysClaims.map(c => c.day_number));
+        const nextDay = maxYesterdayDay + 1;
+        const streak = nextDay > 7 ? 1 : nextDay;
+        this.logger.debug(`User ${userId} had login yesterday (max day ${maxYesterdayDay}) - returning ${streak}`);
+        return streak;
+      }
+
+      // Р•СЃР»Рё РІС…РѕРґ СЃРµРіРѕРґРЅСЏ (diffDays === 0)
+      // РќСѓР¶РЅРѕ РЅР°Р№С‚Рё РњРђРљРЎРРњРђР›Р¬РќР«Р™ РґРµРЅСЊ СЃСЂРµРґРё РєР»РµР№РјРѕРІ Р·Р° РЎР•Р“РћР”РќРЇ
+      if (diffDays === 0) {
+        // Р¤РёР»СЊС‚СЂСѓРµРј С‚РѕР»СЊРєРѕ СЃРµРіРѕРґРЅСЏС€РЅРёРµ РєР»РµР№РјС‹
+        const todaysClaims = claims.filter(claim => {
+          const claimDay = new Date(claim.claimed_at);
+          claimDay.setHours(0, 0, 0, 0);
+          return claimDay.getTime() === today.getTime();
+        });
+
+        if (todaysClaims.length === 0) {
+          // РЎРµРіРѕРґРЅСЏ РµС‰Рµ РЅРёС‡РµРіРѕ РЅРµ Р·Р°Р±РёСЂР°Р»Рё, Р·РЅР°С‡РёС‚ СЌС‚Рѕ РЅРѕРІС‹Р№ РґРµРЅСЊ
+          // Р‘РµСЂРµРј РїРѕСЃР»РµРґРЅРёР№ РєР»РµР№Рј (РІС‡РµСЂР° РёР»Рё СЂР°РЅРµРµ) Рё СЃС‡РёС‚Р°РµРј СЃР»РµРґСѓСЋС‰РёР№ РґРµРЅСЊ
+          const nextDay = lastClaim.day_number + 1;
+          const streak = nextDay > 7 ? 1 : nextDay;
+          this.logger.debug(`User ${userId} no claims today yet - next day ${streak}`);
+          return streak;
+        } else {
+          // Р•СЃС‚СЊ РєР»РµР№РјС‹ СЃРµРіРѕРґРЅСЏ, РЅСѓР¶РЅРѕ РЅР°Р№С‚Рё РњРђРљРЎРРњРђР›Р¬РќР«Р™ РґРµРЅСЊ СЃСЂРµРґРё РЅРёС…
+          const maxDayToday = Math.max(...todaysClaims.map(c => c.day_number));
+          this.logger.debug(`User ${userId} has ${todaysClaims.length} claims today - max day is ${maxDayToday}`);
+          if (maxDayToday === 7) {
+            this.logger.debug(`User ${userId} completed day 7 - cycle resets to 1 tomorrow`);
+            return 1; // Р¦РёРєР» Р·Р°РІРµСЂС€РµРЅ, Р·Р°РІС‚СЂР° РЅР°С‡РЅРµС‚СЃСЏ РЅРѕРІС‹Р№ СЃ РґРЅСЏ 1
+          } else {
+            const nextDay = maxDayToday + 1;
+            this.logger.debug(`User ${userId} can claim next day ${nextDay}`);
+            return nextDay; // РЎР»РµРґСѓСЋС‰РёР№ РґРµРЅСЊ РІ С†РёРєР»Рµ
+          }
+        }
+      }
+
+      // РќР° СЃР»СѓС‡Р°Р№ РµСЃР»Рё С‡С‚Рѕ-С‚Рѕ РїСЂРѕС€Р»Рѕ РЅРµ С‚Р°Рє, РІРµСЂРЅРµРј РґРµРЅСЊ 0
+      this.logger.warn(`User ${userId} - unknown state, returning 0`);
+      return 0;
+    } catch (error) {
+      this.logger.error('Error getting login streak', error.stack);
+      return 1;
+    }
+  }
+
+  /**
+   * РџРѕР»СѓС‡РёС‚СЊ РІСЃРµ 7 РґРЅРµРІРЅС‹С… РЅР°РіСЂР°Рґ + С‚РµРєСѓС‰РёР№ streak
+   */
+  async getLoginRewards(userId: string): Promise<{
+    rewards: LoginRewardResponse[];
+    current_streak: number;
+  }> {
+    console.log(`[getLoginRewards] Starting for user ${userId}`);
+    // РџРѕР»СѓС‡Р°РµРј РІСЃРµ Р±РѕРЅСѓСЃС‹ (РґРЅРё 1-7)
+    const bonuses = await this.dailyBonusRepository.find({
+      order: { day_number: 'ASC' },
+    });
+
+    const currentStreak = await this.getCurrentLoginStreak(userId);
+    this.logger.debug(`Current streak for user ${userId}: ${currentStreak}`);
+
+    // Р”Р»СЏ РєР°Р¶РґРѕРіРѕ РґРЅСЏ РїРѕР»СѓС‡Р°РµРј РёРЅС„РѕСЂРјР°С†РёСЋ Рѕ С‚РѕРј, Р·Р°Р±СЂР°Р» Р»Рё РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅР°РіСЂР°РґСѓ
+    const rewards: LoginRewardResponse[] = bonuses.map((bonus) => {
+      const response: LoginRewardResponse = {
+        day: bonus.day_number,
+        title: this.getRewardTitle(bonus),
+        description: this.getRewardDescription(bonus),
+        reward_type: bonus.reward_type,
+        claimed: false, // РџРѕРєР° С‡С‚Рѕ С„РёРєСЃРёСЂРѕРІР°РЅРЅРѕРµ Р·РЅР°С‡РµРЅРёРµ, РїРѕС‚РѕРј РґРѕР±Р°РІРёРј РїСЂРѕРІРµСЂРєСѓ
+      };
+
+      if (bonus.reward_coins) {
+        response.reward_coins = bonus.reward_coins;
+      }
+      if (bonus.boost_multiplier) {
+        response.boost_multiplier = bonus.boost_multiplier;
+      }
+      if (bonus.boost_duration) {
+        response.boost_duration = bonus.boost_duration;
+      }
+
+      return response;
+    });
+
+    // РџСЂРѕРІРµСЂСЏРµРј РєР°РєРёРµ РЅР°РіСЂР°РґС‹ СѓР¶Рµ Р·Р°Р±СЂР°Р» РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ
+    const claimedRewards = await this.userDailyClaimRepository.find({
+      where: { user_id: userId },
+    });
+
+    const claimedDays = new Set(claimedRewards.map((r) => r.day_number));
+
+    // РџСЂРѕРІРµСЂСЏРµРј РµСЃС‚СЊ Р»Рё РєР»РµР№РјС‹ Р·Р° СЃРµРіРѕРґРЅСЏ
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const claimedToday = claimedRewards.some(claim => {
+      const claimDate = new Date(claim.claimed_at);
+      claimDate.setHours(0, 0, 0, 0);
+      return claimDate.getTime() === today.getTime();
+    });
+
+    const finalRewards = rewards.map((reward) => ({
+      ...reward,
+      claimed: claimedDays.has(reward.day),
+      claimed_today: claimedToday, // РџРµСЂРµРґР°РµРј РёРЅС„РѕСЂРјР°С†РёСЋ С‡С‚Рѕ СѓР¶Рµ Р·Р°СЏРІР»СЏР»Рё РІ СЌС‚РѕС‚ РґРµРЅСЊ
+    }));
+
+    this.logger.debug(`Claimed days: ${Array.from(claimedDays).join(', ')}, Streak: ${currentStreak}`);
+    this.logger.debug(`Returning ${finalRewards.length} rewards`);
+
+    return {
+      rewards: finalRewards,
+      current_streak: currentStreak,
+    };
+  }
+
+  /**
+   * Р—Р°Р±СЂР°С‚СЊ РЅР°РіСЂР°РґСѓ Р·Р° РєРѕРЅРєСЂРµС‚РЅС‹Р№ РґРµРЅСЊ
+   */
+  async claimLoginReward(
+    userId: string,
+    day: number,
+  ): Promise<{
+    success: boolean;
+    reward_type: RewardType;
+    reward_coins?: number;
+    boost_multiplier?: number;
+    boost_duration?: number;
+    message?: string;
+  }> {
+    console.log(`[claimLoginReward] Starting claim process for user ${userId}, day ${day}`);
+    
+    // РџСЂРѕРІРµСЂСЏРµРј РІР°Р»РёРґРЅРѕСЃС‚СЊ РґРЅСЏ
+    if (day < 1 || day > 7) {
+      throw new BadRequestException('Invalid day number (1-7)');
+    }
+
+    // РџРѕР»СѓС‡Р°РµРј С‚РµРєСѓС‰РёР№ streak
+    const currentStreak = await this.getCurrentLoginStreak(userId);
+    this.logger.debug(`Current streak for user ${userId}: ${currentStreak}`);
+
+    // РџСЂРѕРІРµСЂСЏРµРј РЅРµ Р·Р°Р±СЂР°Р» Р»Рё СѓР¶Рµ
+    const existingClaim = await this.userDailyClaimRepository.findOne({
+      where: { user_id: userId, day_number: day },
+    });
+
+    if (existingClaim) {
+      this.logger.debug(`Day ${day} already claimed for user ${userId}`);
+      throw new BadRequestException('Reward already claimed');
+    }
+
+    // Р’РђР–РќРћ: РџСЂРѕРІРµСЂСЏРµРј С‡С‚Рѕ РІ СЌС‚РѕС‚ РєР°Р»РµРЅРґР°СЂРЅС‹Р№ РґРµРЅСЊ РµС‰Рµ РЅРµ Р·Р°Р±РёСЂР°Р»Рё РќРРљРђРљРЈР® РЅР°РіСЂР°РґСѓ
+    // РћРґРЅР° РЅР°РіСЂР°РґР° РІ РґРµРЅСЊ РјР°РєСЃРёРјСѓРј!
+    const allUserClaims = await this.userDailyClaimRepository.find({
+      where: { user_id: userId },
+    });
+
+    // РњРѕР¶РµРј Р»Рё РјС‹ Р·Р°Р±СЂР°С‚СЊ СЌС‚Сѓ РЅР°РіСЂР°РґСѓ?
+    // РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РјРѕР¶РµС‚ Р·Р°Р±СЂР°С‚СЊ РЅР°РіСЂР°РґСѓ С‚РѕР»СЊРєРѕ Р·Р° С‚РµРєСѓС‰РёР№ РґРµРЅСЊ СЃС‚СЂРёРєР°
+
+    // Р•СЃР»Рё РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРёРєРѕРіРґР° РЅРµ Р·Р°Р±РёСЂР°Р» РЅР°РіСЂР°РґСѓ, РїРѕР·РІРѕР»СЏРµРј С‚РѕР»СЊРєРѕ РґРµРЅСЊ 1
+    if (allUserClaims.length === 0) {
+      if (day !== 1) {
+        throw new BadRequestException('You can only claim reward for day 1');
+      }
+    } else {
+      // Р•СЃР»Рё РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ СѓР¶Рµ Р·Р°Р±РёСЂР°Р» РЅР°РіСЂР°РґС‹
+      // РџРѕР·РІРѕР»СЏРµРј Р·Р°Р±РёСЂР°С‚СЊ С‚РѕР»СЊРєРѕ РЅР°РіСЂР°РґС‹ Р·Р° РґРЅРё РєРѕС‚РѕСЂС‹Рµ СЃРѕРѕС‚РІРµС‚СЃС‚РІСѓСЋС‚ С‚РµРєСѓС‰РµРјСѓ СЃС‚СЂРёРєСѓ
+      // РўРµРєСѓС‰РёР№ СЃС‚СЂРёРє РїРѕРєР°Р·С‹РІР°РµС‚ Р·Р° РєР°РєРѕР№ РґРµРЅСЊ РјРѕР¶РЅРѕ СЃРµРіРѕРґРЅСЏ Р·Р°Р±СЂР°С‚СЊ РЅР°РіСЂР°РґСѓ
+      if (day !== currentStreak) {
+        throw new BadRequestException(
+          `You can only claim reward for day ${currentStreak}`,
+        );
+      }
+    }
+
+    // РџРѕР»СѓС‡Р°РµРј Р±РѕРЅСѓСЃ РґР»СЏ СЌС‚РѕРіРѕ РґРЅСЏ
+    const bonus = await this.dailyBonusRepository.findOne({
+      where: { day_number: day },
+    });
+
+    if (!bonus) {
+      throw new NotFoundException('Bonus for this day not found');
+    }
+
+    // РЎРѕС…СЂР°РЅСЏРµРј claim
+    // UNIQUE constraint (user_id, claimed_at::date, day_number) protects from race condition
+    const claim = this.userDailyClaimRepository.create({
+      user_id: userId,
+      day_number: day,
+      reward_received: bonus.reward_type,
+    });
+
+    try {
+      await this.userDailyClaimRepository.save(claim);
+    } catch (saveError: any) {
+      // Check if it's a duplicate key error (PostgreSQL code 23505)
+      if (saveError.code === '23505' || saveError.message?.includes('duplicate key')) {
+        this.logger.warn(`User ${userId} attempted duplicate claim (caught by UNIQUE constraint)`);
+        throw new BadRequestException('You can only claim one reward per day');
+      }
+      // If it's a different error, rethrow it
+      throw saveError;
+    }
+
+    // Update LOGIN_CLAIM task for this user
+    // Find the LOGIN_CLAIM task
+    const loginClaimTask = await this.taskRepository.findOne({
+      where: { task_type: TaskActionType.LOGIN_CLAIM },
+    });
+
+    if (loginClaimTask) {
+      const now = new Date();
+      let userTask = await this.userTaskRepository.findOne({
+        where: { user_id: userId as any, task_id: loginClaimTask.id },
+      });
+
+      if (!userTask) {
+        // Create new LOGIN_CLAIM task for user
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        tomorrow.setHours(0, 0, 0, 0);
+
+        userTask = this.userTaskRepository.create({
+          user_id: userId as any,
+          task_id: loginClaimTask.id,
+          progress: 1,
+          completed: true,
+          completed_at: now,
+          claimed: true,
+          claimed_at: now,
+          reset_at: tomorrow,
+        });
+      } else {
+        // Update existing LOGIN_CLAIM task
+        const resetAt = userTask.reset_at ? new Date(userTask.reset_at) : null;
+
+        // Check if reset is needed
+        if (resetAt && now >= resetAt) {
+          // Reset the task
+          userTask.progress = 1;
+          userTask.completed = true;
+          userTask.completed_at = now;
+          userTask.claimed = true;
+          userTask.claimed_at = now;
+
+          // Set next reset to tomorrow 00:00 UTC
+          const tomorrow = new Date(now);
+          tomorrow.setDate(tomorrow.getDate() + 1);
+          tomorrow.setHours(0, 0, 0, 0);
+          userTask.reset_at = tomorrow;
+        } else {
+          // Just mark as claimed
+          userTask.progress = 1;
+          userTask.completed = true;
+          userTask.completed_at = now;
+          userTask.claimed = true;
+          userTask.claimed_at = now;
+        }
+      }
+
+      await this.userTaskRepository.save(userTask);
+    }
+
+    // РџСЂРѕРІРµСЂРёС‚СЊ РІС‹РїРѕР»РЅРµРЅС‹ Р»Рё Р’РЎР• РµР¶РµРґРЅРµРІРЅС‹Рµ Р·Р°РґР°С‡Рё Рё СѓРІРµР»РёС‡РёС‚СЊ COMPLETE_DAILY_TASKS
+    // Async check (doesn't block response)
+    this.checkCompleteDailyTasksProgress(userId).catch(err => {
+      this.logger.error('Error checking daily tasks', err.stack);
+    });
+    });
+
+    // РћР±РЅРѕРІР»СЏРµРј coins РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ РµСЃР»Рё СЌС‚Рѕ coin reward
+    let updatedUser = await this.userRepository.findOne({ where: { id: userId } });
+    if (!updatedUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (bonus.reward_type === RewardType.COINS && bonus.reward_coins) {
+      const currentCoins = Number(updatedUser.coins) || 0;
+      const rewardCoins = Number(bonus.reward_coins) || 0;
+      updatedUser.coins = currentCoins + rewardCoins;
+      await this.userRepository.save(updatedUser);
+    }
+
+    // РђРєС‚РёРІРёСЂСѓРµРј Р±РѕРЅСѓСЃ РµСЃР»Рё СЌС‚Рѕ boost reward
+    if (bonus.reward_type === RewardType.BOOST && bonus.boost_multiplier && bonus.boost_duration) {
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + bonus.boost_duration * 60 * 1000); // РљРѕРЅРІРµСЂС‚РёСЂСѓРµРј РјРёРЅСѓС‚С‹ РІ РјРёР»Р»РёСЃРµРєСѓРЅРґС‹
+      
+      const boost = this.userBoostRepository.create({
+        user_id: userId,
+        type: BoostType.CLICK_MULTIPLIER,
+        multiplier: bonus.boost_multiplier,
+        activated_at: now,
+        expires_at: expiresAt,
+      });
+      
+      await this.userBoostRepository.save(boost);
+      
+      // РћС‡РёС‰Р°РµРј РєСЌС€ Р±СѓСЃС‚РѕРІ С‡С‚РѕР±С‹ РЅРѕРІС‹Р№ Р±СѓСЃС‚ Р±С‹Р» Р·Р°РіСЂСѓР¶РµРЅ РїСЂРё СЃР»РµРґСѓСЋС‰РµРј РєР»РёРєРµ
+      this.gameService.clearBoostsCache(userId);
+    }
+
+    // РћР±СЂР°Р±РѕС‚РєР° RANDOM РЅР°РіСЂР°РґС‹ (СЃСѓРЅРґСѓРєРё)
+    let randomCoins = 0;
+    let chestBoost: any = null;
+    if (bonus.reward_type === RewardType.RANDOM) {
+      // РћРїСЂРµРґРµР»СЏРµРј С‚РёРї СЃСѓРЅРґСѓРєР° Рё РІРµСЂРѕСЏС‚РЅРѕСЃС‚СЊ РІС‹РїР°РґРµРЅРёСЏ Р±СѓСЃС‚Р°
+      const isLargeChest = bonus.random_options?.type === 'large_chest';
+      
+      // Р”РµРЅСЊ 7 (Р±РѕР»СЊС€РѕР№ СЃСѓРЅРґСѓРє): 30% С€Р°РЅСЃ РЅР° Р±СѓСЃС‚, 70% РЅР° РєРѕРёРЅС‹
+      // Р”РµРЅСЊ 3 (РјР°Р»РµРЅСЊРєРёР№ СЃСѓРЅРґСѓРє): 10% С€Р°РЅСЃ РЅР° Р±СѓСЃС‚, 90% РЅР° РєРѕРёРЅС‹
+      const boostChance = isLargeChest ? 0.3 : 0.1;
+      const rollBoost = Math.random() < boostChance;
+      
+      if (rollBoost) {
+        // Р’С‹РїР°Р» Р±СѓСЃС‚ РІРјРµСЃС‚Рѕ РєРѕРёРЅРѕРІ
+        const now = new Date();
+        const boostDuration = isLargeChest ? 180 : 60; // Р”РµРЅСЊ 7: 3 С‡Р°СЃР°, Р”РµРЅСЊ 3: 1 С‡Р°СЃ
+        const expiresAt = new Date(now.getTime() + boostDuration * 60 * 1000);
+        
+        chestBoost = this.userBoostRepository.create({
+          user_id: userId,
+          type: BoostType.CLICK_MULTIPLIER,
+          multiplier: 2,
+          activated_at: now,
+          expires_at: expiresAt,
+        });
+        
+        await this.userBoostRepository.save(chestBoost);
+        this.gameService.clearBoostsCache(userId);
+      } else {
+        // Р’С‹РїР°Р»Рё РєРѕРёРЅС‹
+        let minCoins = 1000;
+        let maxCoins = 10000;
+        
+        if (isLargeChest) {
+          // Р”РµРЅСЊ 7 - Р±РѕР»СЊС€РѕР№ СЃСѓРЅРґСѓРє: 10000-20000 РєРѕРёРЅРѕРІ
+          minCoins = 10000;
+          maxCoins = 20000;
+        }
+        
+        randomCoins = Math.floor(Math.random() * (maxCoins - minCoins + 1)) + minCoins;
+        
+        // Р”РѕР±Р°РІР»СЏРµРј РјРѕРЅРµС‚С‹ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ
+        const user = await this.userRepository.findOne({ where: { id: userId } });
+        if (user) {
+          const currentCoins = Number(user.coins) || 0;
+          user.coins = currentCoins + randomCoins;
+          await this.userRepository.save(user);
+        }
+      }
+    }
+
+    const response: any = {
+      success: true,
+      reward_type: bonus.reward_type,
+      message: `Reward claimed for day ${day}`,
+    };
+
+    if (bonus.reward_coins) {
+      response.reward_coins = bonus.reward_coins;
+    }
+    if (bonus.boost_multiplier) {
+      response.boost_multiplier = bonus.boost_multiplier;
+    }
+    if (bonus.boost_duration) {
+      response.boost_duration = bonus.boost_duration;
+    }
+    
+    if (bonus.reward_type === RewardType.RANDOM) {
+      if (chestBoost) {
+        // Р’С‹РїР°Р» Р±СѓСЃС‚ РёР· СЃСѓРЅРґСѓРєР°
+        response.chest_boost = {
+          multiplier: chestBoost.multiplier,
+          duration: bonus.random_options?.type === 'large_chest' ? 180 : 60,
+        };
+        response.message = `Chest boost activated for ${response.chest_boost.duration} minutes!`;
+      } else {
+        // Р’С‹РїР°Р»Рё РєРѕРёРЅС‹ РёР· СЃСѓРЅРґСѓРєР°
+        response.reward_coins = randomCoins;
+        response.message = `Chest opened! ${randomCoins} coins received!`;
+      }
+    }
+
+    // Р›РѕРіРёСЂРѕРІР°РЅРёРµ РїРѕР»СѓС‡РµРЅРЅРѕР№ РЅР°РіСЂР°РґС‹
+    this.logger.log(`Reward claimed successfully for user ${userId}, day ${day}, type: ${bonus.reward_type}`);
+
+    if (bonus.reward_coins) {
+      this.logger.debug(`Coins received: ${bonus.reward_coins}`);
+    }
+    if (bonus.boost_multiplier) {
+      this.logger.debug(`Boost: Г—${bonus.boost_multiplier} for ${bonus.boost_duration} minutes`);
+    }
+    if (bonus.reward_type === RewardType.RANDOM) {
+      if (chestBoost) {
+        this.logger.debug(`Random Chest: Boost Г—${chestBoost.multiplier} for ${response.chest_boost.duration} minutes`);
+      } else {
+        this.logger.debug(`Random Chest: ${randomCoins} coins`);
+      }
+    }
+    if (bonus.reward_type === RewardType.TASK_SKIP) {
+      this.logger.debug('Task Skip: User can now skip one daily task');
+    }
+
+    // Р”РѕР±Р°РІР»СЏРµРј С‚РµРєСѓС‰РёР№ Р±Р°Р»Р°РЅСЃ РІ РѕС‚РІРµС‚
+    const freshUser = await this.userRepository.findOne({ where: { id: userId } });
+    if (freshUser) {
+      response.current_balance = freshUser.coins;
+    }
+
+    return response;
+  }
+
+  /**
+   * РђРІС‚РѕРјР°С‚РёС‡РµСЃРєРё РІС‹РїРѕР»РЅРёС‚СЊ РІС‹Р±СЂР°РЅРЅРѕРµ РµР¶РµРґРЅРµРІРЅРѕРµ Р·Р°РґР°РЅРёРµ (РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РєРѕРіРґР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РїРѕР»СѓС‡Р°РµС‚ TASK_SKIP РЅР°РіСЂР°РґСѓ)
+   */
+  async skipDailyTask(userId: string, taskId: string): Promise<{
+    success: boolean;
+    message: string;
+    task_id: string;
+  }> {
+    // РџРѕР»СѓС‡Р°РµРј Р·Р°РґР°С‡Сѓ
+    const task = await this.taskRepository.findOne({
+      where: { id: taskId },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    // РџСЂРѕРІРµСЂСЏРµРј С‡С‚Рѕ СЌС‚Рѕ РµР¶РµРґРЅРµРІРЅРѕРµ Р·Р°РґР°РЅРёРµ
+    if (task.period !== TaskPeriod.DAILY) {
+      throw new BadRequestException('Only daily tasks can be skipped');
+    }
+
+    // РџРѕР»СѓС‡Р°РµРј РёР»Рё СЃРѕР·РґР°РµРј РїСЂРѕРіСЂРµСЃСЃ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ
+    let userTask = await this.userTaskRepository.findOne({
+      where: { 
+        user_id: userId as any, 
+        task_id: taskId,
+      },
+    });
+
+    // РџСЂРѕРІРµСЂСЏРµРј С‡С‚Рѕ Р·Р°РґР°РЅРёРµ РµС‰Рµ РЅРµ РІС‹РїРѕР»РЅРµРЅРѕ
+    if (userTask && userTask.completed) {
+      throw new BadRequestException('This task is already completed and cannot be skipped again');
+    }
+
+    if (!userTask) {
+      userTask = this.userTaskRepository.create({
+        user_id: userId,
+        task_id: taskId,
+        progress: task.requirement_value, // РЈСЃС‚Р°РЅР°РІР»РёРІР°РµРј РјР°РєСЃРёРјР°Р»СЊРЅС‹Р№ РїСЂРѕРіСЂРµСЃСЃ
+        completed: true,
+        completed_at: new Date(),
+        claimed: false, // РќР• Р·Р°Р±РёСЂР°РµРј РЅР°РіСЂР°РґСѓ! РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РґРѕР»Р¶РµРЅ РЅР°Р¶Р°С‚СЊ "РџРѕР»СѓС‡РёС‚СЊ"
+      });
+    } else {
+      // РћР±РЅРѕРІР»СЏРµРј СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёР№ РїСЂРѕРіСЂРµСЃСЃ
+      userTask.progress = task.requirement_value;
+      userTask.completed = true;
+      userTask.completed_at = new Date();
+      // РќР• СѓСЃС‚Р°РЅР°РІР»РёРІР°РµРј claimed = true! РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РґРѕР»Р¶РµРЅ РЅР°Р¶Р°С‚СЊ "РџРѕР»СѓС‡РёС‚СЊ" С‡С‚РѕР±С‹ Р·Р°Р±СЂР°С‚СЊ РЅР°РіСЂР°РґСѓ
+    }
+
+    await this.userTaskRepository.save(userTask);
+
+    return {
+      success: true,
+      task_id: taskId,
+      message: `Task "${task.name}" has been completed!`,
+    };
+  }
+
+  /**
+   * Р’СЃРїРѕРјРѕРіР°С‚РµР»СЊРЅС‹Рµ РјРµС‚РѕРґС‹ РґР»СЏ С„РѕСЂРјР°С‚РёСЂРѕРІР°РЅРёСЏ РЅР°Р·РІР°РЅРёР№ Рё РѕРїРёСЃР°РЅРёР№
+   */
+  private getRewardTitle(bonus: DailyBonus): string {
+    switch (bonus.reward_type) {
+      case RewardType.COINS:
+        return `${bonus.reward_coins?.toLocaleString()} Р·СѓР±РєРѕРёРЅРѕРІ`;
+      case RewardType.BOOST:
+        return `Р‘РѕРЅСѓСЃ Г—${bonus.boost_multiplier} Рє С‚Р°РїР°Рј`;
+      case RewardType.TASK_SKIP:
+        return 'РђРІС‚РѕРІС‹РїРѕР»РЅРµРЅРёРµ Р·Р°РґР°РЅРёСЏ';
+      case RewardType.RANDOM:
+        return `РЎСѓРЅРґСѓРє (Р”РµРЅСЊ ${bonus.day_number})`;
+      default:
+        return 'РќР°РіСЂР°РґР°';
+    }
+  }
+
+  private getRewardDescription(bonus: DailyBonus): string {
+    switch (bonus.reward_type) {
+      case RewardType.COINS:
+        return `РќР°РіСЂР°РґР° Р·Р° РґРµРЅСЊ ${bonus.day_number}`;
+      case RewardType.BOOST:
+        return `Р”РµР№СЃС‚РІСѓРµС‚ ${bonus.boost_duration} РјРёРЅСѓС‚`;
+      case RewardType.TASK_SKIP:
+        return 'РћРґРЅРѕ РµР¶РµРґРЅРµРІРЅРѕРµ Р·Р°РґР°РЅРёРµ РЅР° РІС‹Р±РѕСЂ';
+      case RewardType.RANDOM:
+        return bonus.day_number === 7
+          ? '10.000вЂ“20.000 Р·СѓР±РєРѕРёРЅРѕРІ, Р±РѕРЅСѓСЃ Г—2 РЅР° 3 С‡Р°СЃР° РёР»Рё Р°РІС‚РѕРІС‹РїРѕР»РЅРµРЅРёРµ'
+          : '1.000вЂ“10.000 Р·СѓР±РєРѕРёРЅРѕРІ РёР»Рё Р±РѕРЅСѓСЃ Г—2 РЅР° 1 С‡Р°СЃ';
+      default:
+        return '';
+    }
+  }
+
+  /**
+   * РџСЂРѕРІРµСЂРёС‚СЊ РІС‹РїРѕР»РЅРµРЅС‹ Р»Рё Р’РЎР• 4 РµР¶РµРґРЅРµРІРЅС‹Рµ Р·Р°РґР°С‡Рё
+   * Р•СЃР»Рё РґР° - СѓРІРµР»РёС‡РёС‚СЊ РїСЂРѕРіСЂРµСЃСЃ COMPLETE_DAILY_TASKS
+   */
+  private async checkCompleteDailyTasksProgress(userId: string): Promise<void> {
+    // РџРѕР»СѓС‡РёС‚СЊ РІСЃРµ DAILY Р·Р°РґР°С‡Рё
+    const dailyTasks = await this.taskRepository.find({
+      where: { period: TaskPeriod.DAILY, is_active: true },
+    });
+
+    if (dailyTasks.length === 0) {
+      return;
+    }
+
+    // РџРѕР»СѓС‡РёС‚СЊ РІСЃРµ 4 РµР¶РµРґРЅРµРІРЅС‹Рµ Р·Р°РґР°С‡Рё: TAPS, EARN_COINS, LOGIN_CLAIM, INVITE_FRIEND
+    const dailyTaskTypes = [
+      TaskActionType.TAPS,
+      TaskActionType.EARN_COINS,
+      TaskActionType.LOGIN_CLAIM,
+      TaskActionType.INVITE_FRIEND,
+    ];
+
+    const requiredDailyTasks = dailyTasks.filter(t => dailyTaskTypes.includes(t.task_type));
+
+    // РџРѕР»СѓС‡РёС‚СЊ userTasks РґР»СЏ СЌС‚РёС… РµР¶РµРґРЅРµРІРЅС‹С…
+    const userTasks = await this.userTaskRepository.find({
+      where: {
+        user_id: userId as any,
+        task_id: In(requiredDailyTasks.map(t => t.id)),
+      },
+    });
+
+    // РџСЂРѕРІРµСЂРёС‚СЊ РІСЃРµ Р»Рё completed = true
+    const allTasksCompleted = requiredDailyTasks.every(task =>
+      userTasks.some(ut => ut.task_id === task.id && ut.completed === true)
+    );
+
+    if (allTasksCompleted) {
+      // Increment COMPLETE_DAILY_TASKS progress
+      await this.incrementCompleteDailyTasksProgress(userId);
+    }
+  }
+
+  /**
+   * РЈРІРµР»РёС‡РёС‚СЊ РїСЂРѕРіСЂРµСЃСЃ COMPLETE_DAILY_TASKS РЅР° 1
+   */
+  private async incrementCompleteDailyTasksProgress(userId: string): Promise<void> {
+    // РќР°Р№С‚Рё Р·Р°РґР°С‡Сѓ COMPLETE_DAILY_TASKS
+    const completeDailyTask = await this.taskRepository.findOne({
+      where: { task_type: TaskActionType.COMPLETE_DAILY_TASKS },
+    });
+
+    if (!completeDailyTask) {
+      this.logger.warn('COMPLETE_DAILY_TASKS task not found');
+      return;
+    }
+
+    const now = new Date();
+
+    // РџРѕР»СѓС‡РёС‚СЊ РёР»Рё СЃРѕР·РґР°С‚СЊ userTask РґР»СЏ COMPLETE_DAILY_TASKS
+    let userTask = await this.userTaskRepository.findOne({
+      where: { user_id: userId as any, task_id: completeDailyTask.id },
+    });
+
+    if (!userTask) {
+      // РЎРѕР·РґР°С‚СЊ РЅРѕРІС‹Р№
+      userTask = this.userTaskRepository.create({
+        user_id: userId as any,
+        task_id: completeDailyTask.id,
+        progress: 1,
+        completed: false,
+        claimed: false,
+      });
+    } else {
+      // РЈРІРµР»РёС‡РёС‚СЊ РїСЂРѕРіСЂРµСЃСЃ
+      userTask.progress += 1;
+    }
+
+    // РџСЂРѕРІРµСЂРёС‚СЊ Р·Р°РІРµСЂС€РµРЅРёРµ (РµСЃР»Рё progress == requirement_value)
+    if (userTask.progress >= completeDailyTask.requirement_value && !userTask.completed) {
+      userTask.completed = true;
+      userTask.completed_at = new Date();
+      this.logger.log(`User ${userId} completed COMPLETE_DAILY_TASKS`);
+    }
+
+    await this.userTaskRepository.save(userTask);
+  }
+}
+
